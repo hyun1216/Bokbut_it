@@ -225,8 +225,22 @@ def _resolve_font_family(root: tk.Tk) -> str:
     return "맑은 고딕"
 
 
+def _get_resource_path(relative_path: str) -> Path:
+    """Resolve bundled resource path for both dev and PyInstaller --onefile builds."""
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    return base / relative_path
+
+
 def create_tray_icon_image() -> Image.Image:
-    """Generate a 64x64 modern white & skyblue icon in memory using Pillow."""
+    """Load assets/Bokbut_it.ico at native resolution or fall back to generated icon."""
+    ico_path = _get_resource_path("assets/Bokbut_it.ico")
+    if ico_path.exists():
+        try:
+            with Image.open(ico_path) as ico_img:
+                return ico_img.convert("RGBA")
+        except Exception:
+            pass
+
     img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
 
@@ -817,9 +831,17 @@ class BokbutWidgetApp:
         self.root.attributes("-topmost", bool(self.data.get("topmost", True)))
         self.root.attributes("-alpha", float(self.data.get("alpha", ALPHA_DEFAULT)))
 
+        ico_path = _get_resource_path("assets/Bokbut_it.ico")
         self._tray_pil_image = create_tray_icon_image()
-        self._tk_icon = ImageTk.PhotoImage(self._tray_pil_image)
-        self.root.iconphoto(True, self._tk_icon)
+        if ico_path.exists():
+            try:
+                self.root.iconbitmap(default=str(ico_path))
+            except Exception:
+                self._tk_icon = ImageTk.PhotoImage(self._tray_pil_image)
+                self.root.iconphoto(True, self._tk_icon)
+        else:
+            self._tk_icon = ImageTk.PhotoImage(self._tray_pil_image)
+            self.root.iconphoto(True, self._tk_icon)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         screen_w = self.root.winfo_screenwidth()

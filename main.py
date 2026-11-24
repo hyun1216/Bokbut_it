@@ -431,7 +431,7 @@ class SegmentControl(tk.Canvas):
 
 
 class PillItemCard(tk.Canvas):
-    """Minimalist iOS-style rounded pill card with click-to-copy and feedback."""
+    """Minimalist iOS-style rounded pill card with click-to-copy/open and feedback."""
 
     HEIGHT = 46
 
@@ -442,6 +442,10 @@ class PillItemCard(tk.Canvas):
         is_expanded: bool,
         on_copy: Callable[[], None],
         on_toggle: Callable[[], None],
+        kind: str = "text",
+        on_drag_start: Callable[[PillItemCard, int], None] | None = None,
+        on_drag_move: Callable[[int], None] | None = None,
+        on_drag_end: Callable[[], None] | None = None,
     ) -> None:
         super().__init__(
             parent,
@@ -453,16 +457,26 @@ class PillItemCard(tk.Canvas):
         )
         self._title = title
         self._is_expanded = is_expanded
+        self._kind = kind
         self._on_copy = on_copy
         self._on_toggle = on_toggle
+        self._on_drag_start = on_drag_start
+        self._on_drag_move = on_drag_move
+        self._on_drag_end = on_drag_end
         self._hovered = False
         self._copied = False
         self._reset_after_id: str | None = None
+        self._long_press_id: str | None = None
+        self._press_x = 0
+        self._press_y_root = 0
+        self._dragging = False
 
         self.bind("<Configure>", lambda _e: self._redraw())
         self.bind("<Enter>", self._on_enter)
         self.bind("<Leave>", self._on_leave)
-        self.bind("<Button-1>", self._on_left_click)
+        self.bind("<ButtonPress-1>", self._on_press)
+        self.bind("<B1-Motion>", self._on_drag_motion)
+        self.bind("<ButtonRelease-1>", self._on_release)
         self.bind("<Double-Button-1>", self._on_double_or_right)
         self.bind("<Button-3>", self._on_double_or_right)
 
@@ -474,9 +488,51 @@ class PillItemCard(tk.Canvas):
         self._hovered = False
         self._redraw()
 
-    def _on_left_click(self, event: tk.Event[Any]) -> None:
-        # Leftmost 34px acts as accordion toggle; rest of card copies!
-        if event.x <= 34:
+    def _cancel_long_press(self) -> None:
+        if self._long_press_id is not None:
+            try:
+                self.after_cancel(self._long_press_id)
+            except tk.TclError:
+                pass
+            self._long_press_id = None
+
+    def _on_press(self, event: tk.Event[Any]) -> None:
+        self._press_x = event.x
+        self._press_y_root = event.y_root
+        self._dragging = False
+        self._cancel_long_press()
+        if self._on_drag_start is not None and event.x > 34:
+            self._long_press_id = self.after(260, self._activate_long_press)
+
+    def _activate_long_press(self) -> None:
+        self._long_press_id = None
+        if not self.winfo_exists():
+            return
+        self._dragging = True
+        self.configure(cursor="fleur")
+        self._redraw()
+        if self._on_drag_start is not None:
+            self._on_drag_start(self, self._press_y_root)
+
+    def _on_drag_motion(self, event: tk.Event[Any]) -> None:
+        if self._dragging:
+            if self._on_drag_move is not None:
+                self._on_drag_move(event.y_root)
+            return
+        # If user moves mouse significantly before 260ms, cancel long-press
+        if abs(event.y_root - self._press_y_root) > 8:
+            self._cancel_long_press()
+
+    def _on_release(self, _event: tk.Event[Any]) -> None:
+        self._cancel_long_press()
+        self.configure(cursor="hand2")
+        if self._dragging:
+            self._dragging = False
+            self._redraw()
+            if self._on_drag_end is not None:
+                self._on_drag_end()
+            return
+        if self._press_x <= 34:
             self._on_toggle()
         else:
             self._on_copy()
@@ -505,17 +561,26 @@ class PillItemCard(tk.Canvas):
         w = max(120, self.winfo_width())
         h = self.HEIGHT
 
-        if self._copied:
+        if self._dragging:
+            fill = BG_CARD_ACTIVE
+            outline = ACCENT_BLUE
+            outline_w = 2
+        elif self._copied:
             fill = BG_CARD_ACTIVE
             outline = BORDER_CARD_ACTIVE
+            outline_w = 1
         elif self._hovered:
             fill = BG_CARD_HOVER
             outline = BORDER_CARD
+            outline_w = 1
         else:
             fill = BG_CARD
             outline = BORDER_CARD
+            outline_w = 1
 
-        _draw_rounded_rect(self, 1, 1, w - 2, h - 2, radius=12, fill=fill, outline=outline, width=1)
+        _draw_rounded_rect(
+            self, 1, 1, w - 2, h - 2, radius=12, fill=fill, outline=outline, width=outline_w
+        )
 
         # Crisp vector expand/collapse chevron on the left
         cy = h / 2
@@ -556,14 +621,22 @@ class PillItemCard(tk.Canvas):
             font=(FONT_FAMILY, 10),
         )
 
-        # Right checkmark only when copied
+        # Right icon: checkmark when active, subtle link arrow when idle link card
         if self._copied:
             self.create_text(
                 w - 18,
                 h / 2,
-                text="✓",
+                text="↗" if self._kind == "link" else "✓",
                 fill=ACCENT_BLUE,
                 font=(FONT_FAMILY, 11, "bold"),
+            )
+        elif self._kind == "link":
+            self.create_text(
+                w - 18,
+                h / 2,
+                text="↗",
+                fill=TEXT_SECONDARY,
+                font=(FONT_FAMILY, 10, "bold"),
             )
 
 
@@ -817,6 +890,7 @@ class BokbutWidgetApp:
         self._build_tab_bar()
         self._build_resize_footer()
         self._build_content_area()
+        self._build_edge_resize_handles()
         self._switch_tab("copy")
         self._setup_tray_icon()
         self.root.after(20, lambda: _apply_taskbar_style(self.root))
@@ -911,6 +985,20 @@ class BokbutWidgetApp:
         )
         self.shade_btn.pack(side="right", fill="y", padx=(0, 1))
 
+        self.min_btn = tk.Button(
+            self.header,
+            text="—",
+            bg=BG_HEADER,
+            fg=TEXT_SECONDARY,
+            activebackground=BG_SUBTLE,
+            bd=0,
+            font=(FONT_FAMILY, 9, "bold"),
+            width=3,
+            cursor="hand2",
+            command=self._minimize_to_taskbar,
+        )
+        self.min_btn.pack(side="right", fill="y", padx=(0, 1))
+
         self.pin_btn = tk.Button(
             self.header,
             text="📌",
@@ -953,9 +1041,39 @@ class BokbutWidgetApp:
             padx=6,
         )
         grip.pack(side="right", fill="y")
-        grip.bind("<ButtonPress-1>", self._start_resize)
+        grip.bind("<ButtonPress-1>", lambda e: self._start_resize(e, "se"))
         grip.bind("<B1-Motion>", self._on_resize)
         grip.bind("<ButtonRelease-1>", self._end_resize)
+
+    def _build_edge_resize_handles(self) -> None:
+        """Add thin edge and corner handles so the window can be resized from all 4 sides."""
+        t = 4
+        c = 8
+        specs: list[tuple[str, str, dict[str, Any]]] = [
+            ("n", "size_ns", {"relx": 0.0, "rely": 0.0, "relwidth": 1.0, "height": t}),
+            ("s", "size_ns", {"relx": 0.0, "rely": 1.0, "y": -t, "relwidth": 1.0, "height": t}),
+            ("w", "size_we", {"relx": 0.0, "rely": 0.0, "width": t, "relheight": 1.0}),
+            ("e", "size_we", {"relx": 1.0, "x": -t, "rely": 0.0, "width": t, "relheight": 1.0}),
+            ("nw", "size_nw_se", {"relx": 0.0, "rely": 0.0, "width": c, "height": c}),
+            ("ne", "size_ne_sw", {"relx": 1.0, "x": -c, "rely": 0.0, "width": c, "height": c}),
+            ("sw", "size_ne_sw", {"relx": 0.0, "rely": 1.0, "y": -c, "width": c, "height": c}),
+            ("se", "size_nw_se", {"relx": 1.0, "x": -c, "rely": 1.0, "y": -c, "width": c, "height": c}),
+        ]
+        for direction, cursor_name, place_kw in specs:
+            handle = tk.Frame(self.root, bg=BORDER_WINDOW, cursor=cursor_name)
+            handle.place(**place_kw)
+            handle.lift()
+            handle.bind("<ButtonPress-1>", lambda e, d=direction: self._start_resize(e, d))
+            handle.bind("<B1-Motion>", self._on_resize)
+            handle.bind("<ButtonRelease-1>", self._end_resize)
+
+    def _minimize_to_taskbar(self) -> None:
+        """Minimize the frameless window to the Windows taskbar."""
+        try:
+            hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id()) or self.root.winfo_id()
+            ctypes.windll.user32.ShowWindow(hwnd, 6)
+        except Exception:
+            pass
 
     def _toggle_shade(self) -> None:
         w = self.root.winfo_width()
@@ -994,23 +1112,51 @@ class BokbutWidgetApp:
         }
         save_data(self.data)
 
-    def _start_resize(self, event: tk.Event[Any]) -> None:
+    def _start_resize(self, event: tk.Event[Any], direction: str = "se") -> None:
+        self._resize_dir = direction
         self._resize_start_x = event.x_root
         self._resize_start_y = event.y_root
+        self._resize_start_wx = self.root.winfo_x()
+        self._resize_start_wy = self.root.winfo_y()
         self._resize_start_w = self.root.winfo_width()
         self._resize_start_h = self.root.winfo_height()
 
     def _on_resize(self, event: tk.Event[Any]) -> None:
-        if self._shaded:
-            return
-        new_w = max(MIN_WIDTH, self._resize_start_w + (event.x_root - self._resize_start_x))
-        new_h = max(MIN_HEIGHT, self._resize_start_h + (event.y_root - self._resize_start_y))
-        self.root.geometry(f"{new_w}x{new_h}")
+        d = getattr(self, "_resize_dir", "se")
+        dx = event.x_root - self._resize_start_x
+        dy = event.y_root - self._resize_start_y
+
+        new_x = self._resize_start_wx
+        new_y = self._resize_start_wy
+        new_w = self._resize_start_w
+        new_h = self._resize_start_h
+
+        if "e" in d:
+            new_w = max(MIN_WIDTH, self._resize_start_w + dx)
+        if "w" in d:
+            max_dx = self._resize_start_w - MIN_WIDTH
+            clamped_dx = min(dx, max_dx)
+            new_w = self._resize_start_w - clamped_dx
+            new_x = self._resize_start_wx + clamped_dx
+
+        if not self._shaded:
+            if "s" in d:
+                new_h = max(MIN_HEIGHT, self._resize_start_h + dy)
+            if "n" in d:
+                max_dy = self._resize_start_h - MIN_HEIGHT
+                clamped_dy = min(dy, max_dy)
+                new_h = self._resize_start_h - clamped_dy
+                new_y = self._resize_start_wy + clamped_dy
+
+        self.root.geometry(f"{new_w}x{new_h}+{new_x}+{new_y}")
 
     def _end_resize(self, _event: tk.Event[Any]) -> None:
-        if self._shaded:
-            return
-        self._expanded_height = self.root.winfo_height()
+        if not self._shaded:
+            self._expanded_height = self.root.winfo_height()
+        self.data["window_pos"] = {
+            "x": self.root.winfo_x(),
+            "y": self.root.winfo_y(),
+        }
         self.data["window_size"] = {
             "width": self.root.winfo_width(),
             "height": self._expanded_height,
@@ -1103,6 +1249,12 @@ class BokbutWidgetApp:
 
     def _restore_from_tray(self) -> None:
         self.root.deiconify()
+        try:
+            hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id()) or self.root.winfo_id()
+            if ctypes.windll.user32.IsIconic(hwnd):
+                ctypes.windll.user32.ShowWindow(hwnd, 9)
+        except Exception:
+            pass
         _apply_taskbar_style(self.root)
         self.root.attributes("-topmost", bool(self.data.get("topmost", True)))
         self.root.lift()
@@ -1485,6 +1637,7 @@ class BokbutWidgetApp:
         is_collapsed = bool(card.get("collapsed", True))
         title_text = card.get("title") or "(제목 없음)"
         content_text = card.get("content", "")
+        kind = "link" if card.get("kind") == "link" else "text"
 
         pill = PillItemCard(
             wrapper,
@@ -1492,9 +1645,15 @@ class BokbutWidgetApp:
             is_expanded=not is_collapsed,
             on_copy=lambda: None,
             on_toggle=lambda c=card: self._toggle_copy_card_collapse(c),
+            kind=kind,
+            on_drag_start=lambda _p, y, cid=card["id"]: self._start_card_drag(cid, y),
+            on_drag_move=self._update_card_drag,
+            on_drag_end=self._finish_card_drag,
         )
         pill._on_copy = (
-            lambda txt=content_text, ttl=title_text, p=pill: self._handle_copy_click(txt, ttl, p)
+            lambda txt=content_text, ttl=title_text, k=kind, p=pill: self._handle_card_action(
+                txt, ttl, k, p
+            )
         )
         pill.pack(fill="x")
 
@@ -1554,12 +1713,76 @@ class BokbutWidgetApp:
                 command=lambda c=card: self._open_copy_modal(c),
             ).pack(side="right", padx=(0, 4))
 
+    def _start_card_drag(self, card_id: str, y_root: int) -> None:
+        self._drag_card_id = card_id
+        self._drag_target_idx: int | None = None
+        if not hasattr(self, "_drop_line") or not self._drop_line.winfo_exists():
+            self._drop_line = tk.Frame(self.copy_scroll.inner, bg=ACCENT_BLUE, height=3)
+        self._show_copy_toast("↕️ 위아래로 드래그하여 위치를 이동하세요")
+        self._update_card_drag(y_root)
+
+    def _update_card_drag(self, y_root: int) -> None:
+        container = self.copy_scroll.inner
+        wrappers = [w for w in container.winfo_children() if w is not getattr(self, "_drop_line", None)]
+        if not wrappers:
+            return
+
+        target_idx = len(wrappers)
+        line_y = wrappers[-1].winfo_y() + wrappers[-1].winfo_height()
+        for i, w in enumerate(wrappers):
+            mid_y_root = w.winfo_rooty() + w.winfo_height() // 2
+            if y_root < mid_y_root:
+                target_idx = i
+                line_y = max(0, w.winfo_y() - 2)
+                break
+
+        self._drag_target_idx = target_idx
+        self._drop_line.place(in_=container, x=4, relwidth=1.0, width=-8, y=line_y, height=3)
+        self._drop_line.lift()
+
+    def _finish_card_drag(self) -> None:
+        if hasattr(self, "_drop_line") and self._drop_line.winfo_exists():
+            self._drop_line.place_forget()
+
+        card_id = getattr(self, "_drag_card_id", None)
+        target_idx = getattr(self, "_drag_target_idx", None)
+        self._drag_card_id = None
+        self._drag_target_idx = None
+
+        if card_id is None or target_idx is None:
+            return
+
+        cards = self.data.get("copy_cards", [])
+        if self._copy_search_query:
+            return
+        cur_idx = next((i for i, c in enumerate(cards) if c["id"] == card_id), None)
+        if cur_idx is None:
+            return
+
+        insert_idx = target_idx if target_idx <= cur_idx else target_idx - 1
+        insert_idx = max(0, min(len(cards) - 1, insert_idx))
+        if insert_idx != cur_idx:
+            item = cards.pop(cur_idx)
+            cards.insert(insert_idx, item)
+            save_data(self.data)
+            self._render_copy_cards()
+
     def _toggle_copy_card_collapse(self, card: dict[str, Any]) -> None:
         card["collapsed"] = not bool(card.get("collapsed", True))
         save_data(self.data)
         self._render_copy_cards()
 
-    def _handle_copy_click(self, text: str, title: str, pill: PillItemCard) -> None:
+    def _handle_card_action(self, text: str, title: str, kind: str, pill: PillItemCard) -> None:
+        if kind == "link":
+            url = text.strip()
+            if url and not url.startswith(("http://", "https://", "mailto:", "file://")):
+                url = "https://" + url
+            if url:
+                webbrowser.open(url)
+                pill.trigger_copied_feedback()
+                self._show_copy_toast(f"↗ 링크 열림: {title}")
+            return
+
         self._copy_to_clipboard(text)
         pill.trigger_copied_feedback()
         self._show_copy_toast(f"✓ 복사됨: {title}")
@@ -1584,7 +1807,52 @@ class BokbutWidgetApp:
 
     def _open_copy_modal(self, card: dict[str, Any] | None) -> None:
         is_edit = card is not None
-        modal = self._create_modal("텍스트 수정" if is_edit else "새 텍스트 추가")
+        modal = self._create_modal("항목 수정" if is_edit else "새 항목 추가")
+
+        kind_var = tk.StringVar(
+            value="link" if (is_edit and card is not None and card.get("kind") == "link") else "text"
+        )
+
+        tk.Label(
+            modal.body,
+            text="유형",
+            bg=BG_MAIN,
+            fg=TEXT_PRIMARY,
+            font=(FONT_FAMILY, 9, "bold"),
+            anchor="w",
+        ).pack(fill="x", pady=(0, 3))
+
+        kind_row = tk.Frame(modal.body, bg=BG_MAIN)
+        kind_row.pack(fill="x", pady=(0, 8))
+
+        content_label = tk.Label(
+            modal.body,
+            text="이동할 URL" if kind_var.get() == "link" else "복사할 내용",
+            bg=BG_MAIN,
+            fg=TEXT_PRIMARY,
+            font=(FONT_FAMILY, 9, "bold"),
+            anchor="w",
+        )
+
+        def on_kind_change() -> None:
+            content_label.configure(
+                text="이동할 URL" if kind_var.get() == "link" else "복사할 내용"
+            )
+
+        for val, text in (("text", "텍스트 (클릭 시 복사)"), ("link", "링크 (클릭 시 이동)")):
+            tk.Radiobutton(
+                kind_row,
+                text=text,
+                variable=kind_var,
+                value=val,
+                bg=BG_MAIN,
+                fg=TEXT_PRIMARY,
+                activebackground=BG_MAIN,
+                selectcolor=BG_CARD,
+                font=(FONT_FAMILY, 9),
+                cursor="hand2",
+                command=on_kind_change,
+            ).pack(side="left", padx=(0, 12))
 
         tk.Label(
             modal.body,
@@ -1607,14 +1875,7 @@ class BokbutWidgetApp:
             title_entry.insert(0, card.get("title", ""))
         title_entry.pack(fill="x", pady=(0, 10))
 
-        tk.Label(
-            modal.body,
-            text="복사할 내용",
-            bg=BG_MAIN,
-            fg=TEXT_PRIMARY,
-            font=(FONT_FAMILY, 9, "bold"),
-            anchor="w",
-        ).pack(fill="x", pady=(0, 3))
+        content_label.pack(fill="x", pady=(0, 3))
 
         content_text = tk.Text(
             modal.body,
@@ -1635,17 +1896,20 @@ class BokbutWidgetApp:
         content_text.pack(fill="x", pady=(0, 12))
 
         def save_card() -> None:
+            new_kind = kind_var.get()
             new_title = title_entry.get().strip() or "제목 없음"
             new_content = content_text.get("1.0", "end-1c").strip()
             if not new_content:
                 return
             if is_edit and card is not None:
+                card["kind"] = new_kind
                 card["title"] = new_title
                 card["content"] = new_content
             else:
                 self.data["copy_cards"].append(
                     {
                         "id": str(uuid.uuid4()),
+                        "kind": new_kind,
                         "title": new_title,
                         "content": new_content,
                         "collapsed": True,

@@ -90,6 +90,7 @@ def _merge_with_defaults(loaded: Any) -> dict[str, Any]:
                         "id": str(item.get("id") or uuid.uuid4()),
                         "title": str(item.get("title", "")),
                         "content": str(item.get("content", "")),
+                        "kind": "link" if item.get("kind") == "link" else "text",
                         "collapsed": bool(item.get("collapsed", False)),
                     }
                 )

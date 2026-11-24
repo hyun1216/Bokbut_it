@@ -18,7 +18,11 @@ def get_app_dir() -> Path:
 
 
 def get_data_file_path() -> Path:
-    """Return the path to ./data/widget_data.json."""
+    """Return the persistent JSON path (AppData\\Local\\Bokbut_it for .exe, ./data for dev)."""
+    if getattr(sys, "frozen", False):
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        base = Path(local_app_data) if local_app_data else (Path.home() / "AppData" / "Local")
+        return base / "Bokbut_it" / "widget_data.json"
     return get_app_dir() / "data" / "widget_data.json"
 
 
@@ -34,8 +38,8 @@ def create_default_data() -> dict[str, Any]:
         "shortcuts": [
             {
                 "id": str(uuid.uuid4()),
-                "name": "일일보고서 양식",
-                "template": "노새봄\n{오늘날짜} ({요일}) {현재시간}\n안산 사무실",
+                "name": "업무 기록 예시",
+                "template": "[{오늘날짜} ({요일}) {현재시간}]\n업무 내용: {입력:업무내용}",
             }
         ],
     }

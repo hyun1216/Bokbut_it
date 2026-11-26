@@ -62,6 +62,61 @@ APP_REG_NAME = "Bokbut_it"
 APP_VERSION = "v1.0"
 SUPPORT_URL = "https://buymeacoffee.com/devom"
 
+SINGLE_INSTANCE_MUTEX = "Local\\Bokbut_it_SingleInstance_Mutex"
+WAKEUP_EVENT_NAME = "Local\\Bokbut_it_Wakeup_Event"
+
+
+class SingleInstanceGuard:
+    """Prevent duplicate app instances and wake up the existing window on relaunch."""
+
+    def __init__(self) -> None:
+        self._kernel32 = ctypes.windll.kernel32
+        self._mutex_handle: int | None = None
+        self._event_handle: int | None = None
+        self._stopped = False
+
+    def acquire(self) -> bool:
+        """Return True if this is the primary instance, or signal existing one and return False."""
+        mutex = self._kernel32.CreateMutexW(None, False, SINGLE_INSTANCE_MUTEX)
+        last_err = self._kernel32.GetLastError()
+        if last_err == 183:  # ERROR_ALREADY_EXISTS
+            if mutex:
+                self._kernel32.CloseHandle(mutex)
+            ev = self._kernel32.OpenEventW(0x0002, False, WAKEUP_EVENT_NAME)
+            if ev:
+                self._kernel32.SetEvent(ev)
+                self._kernel32.CloseHandle(ev)
+            return False
+
+        self._mutex_handle = mutex
+        self._event_handle = self._kernel32.CreateEventW(None, False, False, WAKEUP_EVENT_NAME)
+        return True
+
+    def start_listener(self, on_wakeup: Callable[[], None]) -> None:
+        """Listen on a daemon thread for wakeup signals from secondary launches."""
+        if not self._event_handle:
+            return
+
+        def _wait_loop() -> None:
+            while not self._stopped:
+                res = self._kernel32.WaitForSingleObject(self._event_handle, 500)
+                if self._stopped:
+                    break
+                if res == 0:  # WAIT_OBJECT_0
+                    on_wakeup()
+
+        threading.Thread(target=_wait_loop, daemon=True).start()
+
+    def release(self) -> None:
+        self._stopped = True
+        if self._event_handle:
+            self._kernel32.SetEvent(self._event_handle)
+            self._kernel32.CloseHandle(self._event_handle)
+            self._event_handle = None
+        if self._mutex_handle:
+            self._kernel32.CloseHandle(self._mutex_handle)
+            self._mutex_handle = None
+
 FRIENDLY_TAG_LABELS: dict[str, str] = {
     "{오늘날짜}": "📅 오늘날짜",
     "{오늘날짜_간략}": "📅 간략날짜",
@@ -861,9 +916,14 @@ class StyledModal(tk.Toplevel):
 class BokbutWidgetApp:
     """Main application controller for Bokbut_it."""
 
-    def __init__(self, root: tk.Tk) -> None:
+    def __init__(
+        self,
+        root: tk.Tk,
+        instance_guard: SingleInstanceGuard | None = None,
+    ) -> None:
         global FONT_FAMILY
         self.root = root
+        self._instance_guard = instance_guard
         FONT_FAMILY = _resolve_font_family(root)
         self.data = load_data()
         self.active_tab = "copy"
@@ -893,6 +953,8 @@ class BokbutWidgetApp:
         self._build_edge_resize_handles()
         self._switch_tab("copy")
         self._setup_tray_icon()
+        if self._instance_guard is not None:
+            self._instance_guard.start_listener(lambda: self.root.after(0, self._restore_from_tray))
         self.root.after(20, lambda: _apply_taskbar_style(self.root))
 
     # ------------------------------------------------------------------
@@ -1256,12 +1318,16 @@ class BokbutWidgetApp:
         except Exception:
             pass
         _apply_taskbar_style(self.root)
-        self.root.attributes("-topmost", bool(self.data.get("topmost", True)))
+        self.root.attributes("-topmost", True)
         self.root.lift()
         self.root.focus_force()
+        if not bool(self.data.get("topmost", True)):
+            self.root.after(50, lambda: self.root.attributes("-topmost", False))
 
     def _quit_app(self) -> None:
         self._save_current_state()
+        if self._instance_guard is not None:
+            self._instance_guard.release()
         if hasattr(self, "tray_icon") and self.tray_icon is not None:
             try:
                 self.tray_icon.stop()
@@ -2381,9 +2447,12 @@ class BokbutWidgetApp:
 
 
 def main() -> None:
+    guard = SingleInstanceGuard()
+    if not guard.acquire():
+        return
     _enable_windows_dpi_awareness()
     root = tk.Tk()
-    BokbutWidgetApp(root)
+    BokbutWidgetApp(root, instance_guard=guard)
     root.mainloop()
 
 
